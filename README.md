@@ -1,3 +1,6 @@
+# News
+* Our new paper ["Generative Distribution Distillation"]() achieves new state-of-the-art on **supervised and unsupervised knowledge distillation**. [Code](https://github.com/jiequancui/Generative-Distribution-Distillation) is released.
+
 # Generalized Kullback-Leibler (DKL) Divergence Loss
 This repository contains the implementation code for our **NeurIPS 2024** paper **Decoupled Kullback-Leibler (DKL) Divergence Loss**, [arXiv](https://arxiv.org/pdf/2305.13948) and our arXiv paper **Generalized Kullback-Leibler Divergence Loss**, [arXiv]().
 
