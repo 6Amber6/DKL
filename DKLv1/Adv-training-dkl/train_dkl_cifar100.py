@@ -19,7 +19,7 @@ from dataset import cifar
 
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR TRADES Adversarial Training')
-parser.add_argument('--arch', type=str, default='WideResNet34')
+parser.add_argument('--arch', type=str, default='WideResNet34_10')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
 parser.add_argument('--test-batch-size', type=int, default=128, metavar='N',
