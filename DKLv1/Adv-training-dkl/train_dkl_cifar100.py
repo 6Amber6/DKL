@@ -55,7 +55,7 @@ parser.add_argument('--resume-model', default='', type=str,
                     help='directory of model for retraining')
 parser.add_argument('--resume-optim', default='', type=str,
                     help='directory of optimizer for retraining')
-parser.add_argument('--save-freq', '-s', default=50, type=int, metavar='N',
+parser.add_argument('--save-freq', '-s', default=25, type=int, metavar='N',
                     help='save frequency')
 
 # AWP
