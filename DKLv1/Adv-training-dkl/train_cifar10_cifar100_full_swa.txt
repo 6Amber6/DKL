@@ -2,7 +2,7 @@
 # save_freq=1 -> ~70 GB per exp, ~140 GB for both
 
 # CIFAR-10 
-# train
+# train (run in DKLv1/Adv-training-dkl)
 python train_dkl_cifar10.py \
   --arch WideResNet34_10 \
   --data CIFAR10 \
@@ -16,13 +16,13 @@ python train_dkl_cifar10.py \
   --epochs 200 \
   --seed 0
 
-# swa (run after train)
+# swa (run after train, still in DKLv1/Adv-training-dkl)
 python swa.py workdir/cifar10_dkl_a4b20t4 0.9 1 200
 
 
 
 # CIFAR-100 
-# train
+# train (run in DKLv1/Adv-training-dkl)
 python train_dkl_cifar100.py \
   --arch WideResNet34_10 \
   --data CIFAR100 \
@@ -36,5 +36,5 @@ python train_dkl_cifar100.py \
   --epochs 200 \
   --seed 0
 
-# swa (run after train)
+# swa (run after train, still in DKLv1/Adv-training-dkl)
 python swa.py workdir/cifar100_dkl_a5b20t4 0.9 1 200
