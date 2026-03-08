@@ -1,0 +1,16 @@
+# Eval SWA models (ours-model-epoch-SWA0.91200.pt)
+# cd $HOME/DKL/DKLv1/Adv-training-dkl/auto_attacks  
+
+# CIFAR-10
+python eval.py --arch WideResNet34 \
+  --checkpoint $HOME/DKL/DKLv1/Adv-training-dkl/workdir/cifar10_dkl_a4b20t4/ours-model-epoch-SWA0.91200.pt \
+  --data CIFAR10 \
+  --preprocess '01' \
+  --log_path $HOME/DKL/DKLv1/Adv-training-dkl/auto_attacks/logs/cifar10_dkl_a4b20t4_swa.log
+
+# CIFAR-100
+python eval.py --arch WideResNet34 \
+  --checkpoint $HOME/DKL/DKLv1/Adv-training-dkl/workdir/cifar100_dkl_a5b20t4/ours-model-epoch-SWA0.91200.pt \
+  --data CIFAR100 \
+  --preprocess '01' \
+  --log_path $HOME/DKL/DKLv1/Adv-training-dkl/auto_attacks/logs/cifar100_dkl_a5b20t4_swa.log
