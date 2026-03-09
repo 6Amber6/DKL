@@ -23,7 +23,7 @@ conda activate base
 
 PROJECT_DIR=/home/tong.li003/DKL/DKLv1/Adv-training-dkl
 cd $PROJECT_DIR/auto_attacks
-export PYTHONPATH=$PROJECT_DIR:$PYTHONPATH
+export PYTHONPATH=$PROJECT_DIR/auto_attacks:$PROJECT_DIR:$PYTHONPATH
 
 echo "Now in: $(pwd)"
 
