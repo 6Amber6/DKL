@@ -9,7 +9,6 @@ import torchvision.transforms as transforms
 
 import sys
 from models.wideresnet import *
-from models.wideresnetwithswish import wideresnetwithswish
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
@@ -92,6 +91,7 @@ if __name__ == '__main__':
     elif args.arch == 'PreActResNet18':
         net = PreActResNet18(num_classes=num_classes)
     elif args.arch == 'wrn-28-10-swish':
+        from models.wideresnetwithswish import wideresnetwithswish
         if args.data == 'CIFAR100':
             dataset = 'cifar100' 
             num_classes = 100 
