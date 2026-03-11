@@ -247,7 +247,7 @@ def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight,
         model.train()
 
         if epoch >= args.awp_warmup:
-            awp = awp_adversary.calc_awp(x_adv, x_natural, target, args.alpha, args.beta, sample_weight)
+            awp = awp_adversary.calc_awp(x_adv, x_natural, target, sample_weight, args.alpha, args.beta)
             awp_adversary.perturb(awp)
 
         optimizer.zero_grad()
