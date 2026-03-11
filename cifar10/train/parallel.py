@@ -192,6 +192,8 @@ parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resume', default='auto', help='path to checkpoint or "auto" for model_dir/checkpoint-last.pt')
 parser.add_argument('--use-ema', action='store_true', default=True, help='use EMA of weights (default: True)')
 parser.add_argument('--no-ema', action='store_false', dest='use_ema', help='disable EMA (e.g. for DKL-style SWA later)')
+parser.add_argument('--save-start', type=int, default=100, help='first epoch to save fusion (then every save-freq)')
+parser.add_argument('--save-freq', type=int, default=20, help='save fusion every N epochs from save-start')
 args = parser.parse_args()
 
 NUM_CLASSES = 10
@@ -493,7 +495,7 @@ def main():
         }
         torch.save(ckpt, os.path.join(model_dir, 'checkpoint-last.pt'))
 
-        if ep % 5 == 0 or ep == args.epochs_fusion:
+        if ep >= args.save_start and (ep - args.save_start) % args.save_freq == 0:
             if ep == args.epochs_fusion and ema is not None:
                 for n, p in fusion.named_parameters():
                     if n in ema.shadow:
