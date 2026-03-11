@@ -487,7 +487,7 @@ def main():
         if ema is not None:
             ema.restore(fusion)
         fusion.train()
-        print(f'[DKL][{ep}/{args.epochs_fusion}] loss={loss_avg:.4f} acc={acc_avg*100:.2f}% val={val_acc*100:.2f}%')
+        print(f'[DKL][{ep}/{args.epochs_fusion}] loss={loss_avg:.4f} acc={acc_avg:.2f}% val={val_acc*100:.2f}%')
 
         ckpt = {
             'm4_state_dict': m4.state_dict(),
