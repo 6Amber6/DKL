@@ -481,7 +481,12 @@ def main():
             bn_unfrozen = True
             print(f'[INFO] Unfroze BN at epoch {ep}')
 
+        if ema is not None:
+            ema.apply_to(fusion)
         val_acc = test(fusion, test_loader, device)
+        if ema is not None:
+            ema.restore(fusion)
+        fusion.train()
         print(f'[DKL][{ep}/{args.epochs_fusion}] loss={loss_avg:.4f} acc={acc_avg*100:.2f}% val={val_acc*100:.2f}%')
 
         ckpt = {

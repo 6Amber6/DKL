@@ -1,11 +1,8 @@
 """
-DKL-based Gated Fusion WRN Training for CIFAR-10.
-Baseline: DKL. Architecture: 4-class + 6-class submodels, gated fusion (alpha*e4 + (1-alpha)*e6) -> 10-class.
-
-Loss: L = L_nat + L_robust + L_aux.
-  L_nat = CE(logits_nat, y).
-  L_robust = DKL: beta * wMSE + alpha * SCE, with sample weight.
-  L_aux = 0.02 * (CE on 4-class head for vehicle + CE on 6-class head for animal).
+DKL-based Soft Routing Confidence WRN Training for CIFAR-10.
+Architecture: 4+1 (vehicle+unk) + 6+1 (animal+unk) submodels, confidence-based soft routing -> 10-class.
+Routing: w = softmax([c4, c6]/T), c4=1-P(unk4), c6=1-P(unk6).
+Fully aligned with DKL: 0-1 data, DKL loss, AWP, CosineAnnealingLR, save100_20.
 """
 from __future__ import print_function
 import os
@@ -15,18 +12,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import MultiStepLR
 from torchvision import transforms, datasets
 
 _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _root)
 sys.path.insert(0, os.path.join(_root, 'DKLv1', 'Adv-training-dkl'))
-from cifar10.model.parallel_wrn import WRNWithEmbedding, GatedFusionWRN
+from cifar10.model.parallel_wrn import WRNWithEmbedding
+from cifar10.model.soft_routing_wrn import SoftRoutingConfidenceFusion, VEHICLE_CLASSES, ANIMAL_CLASSES
 from utils import Bar, AverageMeter, accuracy
 from utils_awp import TradesAWP
 
-VEHICLE_CLASSES = [0, 1, 8, 9]
-ANIMAL_CLASSES = [2, 3, 4, 5, 6, 7]
+NUM_CLASSES = 10
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 class EMA:
@@ -56,22 +54,24 @@ class EMA:
                 p.data.copy_(self.backup[n])
 
 
-class CIFARSubset(torch.utils.data.Dataset):
-    def __init__(self, base_dataset, keep_classes):
+class CIFARUnknownDataset(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, known_classes):
         self.base = base_dataset
-        self.map = {c: i for i, c in enumerate(keep_classes)}
-        targets = torch.tensor(self.base.targets)
-        self.idx = (
-            (targets.unsqueeze(1) == torch.tensor(keep_classes))
-            .any(dim=1).nonzero(as_tuple=False).view(-1)
-        )
+        self.known = list(known_classes)
+        self.map = {c: i for i, c in enumerate(self.known)}
+        self.known_set = set(self.known)
+        self.unknown_idx = len(self.known)
 
     def __len__(self):
-        return len(self.idx)
+        return len(self.base)
 
     def __getitem__(self, i):
-        x, y = self.base[self.idx[i]]
-        return x, self.map[y]
+        x, y = self.base[i]
+        if y in self.known_set:
+            y = self.map[y]
+        else:
+            y = self.unknown_idx
+        return x, y
 
 
 def freeze_bn(model):
@@ -80,6 +80,7 @@ def freeze_bn(model):
             m.eval()
             for p in m.parameters():
                 p.requires_grad = False
+
 
 def unfreeze_bn(model):
     for m in model.modules():
@@ -98,18 +99,25 @@ def dkl_loss(logits_nat, logits_adv, weight, alpha, beta):
     return beta * loss_mse + alpha * loss_sce
 
 
-def aux_ce_loss(logits4, logits6, y, device, weight=0.02):
+def build_lut(classes, device_):
+    lut = torch.full((10,), -1, device=device_, dtype=torch.long)
+    for i, c in enumerate(classes):
+        lut[c] = i
+    return lut
+
+
+def aux_ce_loss(logits4, logits6, y, lut4, lut6, weight=0.02):
     loss = 0.0
     if logits4 is not None:
-        mask4 = torch.isin(y, torch.tensor(VEHICLE_CLASSES, device=device))
-        if mask4.any():
-            remap4 = torch.tensor(VEHICLE_CLASSES, device=device)
-            loss += F.cross_entropy(logits4[mask4], torch.searchsorted(remap4, y[mask4]))
+        idx4 = lut4[y]
+        m4 = idx4 != -1
+        if m4.any():
+            loss += F.cross_entropy(logits4[m4], idx4[m4])
     if logits6 is not None:
-        mask6 = torch.isin(y, torch.tensor(ANIMAL_CLASSES, device=device))
-        if mask6.any():
-            remap6 = torch.tensor(ANIMAL_CLASSES, device=device)
-            loss += F.cross_entropy(logits6[mask6], torch.searchsorted(remap6, y[mask6]))
+        idx6 = lut6[y]
+        m6 = idx6 != -1
+        if m6.any():
+            loss += F.cross_entropy(logits6[m6], idx6[m6])
     return weight * loss
 
 
@@ -129,12 +137,17 @@ def perturb_input(model, x_natural, step_size, epsilon, perturb_steps, weight, d
     return x_adv
 
 
-def backbone_lr_ratio(epoch, total_epochs, r1=0.2, r2=0.2, r3=0.2):
-    """Gated: fixed ratio 0.2 (same as TRADES gated)."""
-    return r1
+def backbone_lr_ratio(epoch, total_epochs, r1=0.15, r2=0.5, r3=0.35):
+    p1 = max(1, int(total_epochs * 0.3))
+    p2 = max(p1 + 1, int(total_epochs * 0.7))
+    if epoch <= p1:
+        return r1
+    if epoch <= p2:
+        return r2
+    return r3
 
 
-parser = argparse.ArgumentParser(description='DKL Gated Fusion WRN CIFAR-10')
+parser = argparse.ArgumentParser(description='DKL Soft Routing Confidence WRN CIFAR-10')
 parser.add_argument('--epochs-sub', type=int, default=100)
 parser.add_argument('--epochs-fusion', type=int, default=200)
 parser.add_argument('--batch-size', type=int, default=128)
@@ -147,26 +160,27 @@ parser.add_argument('--beta', type=float, default=20.0)
 parser.add_argument('--T', type=float, default=4.0)
 parser.add_argument('--train_budget', type=str, default='high', choices=['low', 'high'])
 parser.add_argument('--model-dir', default='./workdir')
-parser.add_argument('--mark', type=str, default='gated')
+parser.add_argument('--mark', type=str, default='soft_routing_conf')
 parser.add_argument('--data-path', type=str, default='../data')
 parser.add_argument('--awp-gamma', type=float, default=0.005)
 parser.add_argument('--awp-warmup', type=int, default=10)
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resume', default='auto', help='path to checkpoint or "auto" for model_dir/checkpoint-last.pt')
-parser.add_argument('--use-ema', action='store_true', default=True, help='use EMA of weights (default: True)')
-parser.add_argument('--no-ema', action='store_false', dest='use_ema', help='disable EMA (e.g. for DKL-style SWA later)')
-parser.add_argument('--save-start', type=int, default=100, help='first epoch to save fusion (then every save-freq)')
-parser.add_argument('--save-freq', type=int, default=20, help='save fusion every N epochs from save-start')
+parser.add_argument('--use-ema', action='store_true', default=True)
+parser.add_argument('--no-ema', action='store_false', dest='use_ema')
+parser.add_argument('--save-start', type=int, default=100)
+parser.add_argument('--save-freq', type=int, default=20)
+parser.add_argument('--route-T', type=float, default=1.0)
+parser.add_argument('--route-margin', type=float, default=0.0)
 args = parser.parse_args()
 
-NUM_CLASSES = 10
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
 
 model_dir = os.path.join(args.model_dir, args.mark)
 os.makedirs(model_dir, exist_ok=True)
 
+# DKL: 0-1 range, basic aug
 transform_sub = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
@@ -184,11 +198,11 @@ base_train_fusion = datasets.CIFAR10(root=args.data_path, train=True, download=T
 testset = datasets.CIFAR10(root=args.data_path, train=False, download=True, transform=transform_test)
 
 train_loader_4 = torch.utils.data.DataLoader(
-    CIFARSubset(base_train_sub, VEHICLE_CLASSES),
+    CIFARUnknownDataset(base_train_sub, VEHICLE_CLASSES),
     batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
 )
 train_loader_6 = torch.utils.data.DataLoader(
-    CIFARSubset(base_train_sub, ANIMAL_CLASSES),
+    CIFARUnknownDataset(base_train_sub, ANIMAL_CLASSES),
     batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
 )
 train_loader_10 = torch.utils.data.DataLoader(
@@ -203,7 +217,8 @@ def train_ce_epoch(model, loader, optimizer, device):
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        logits = model(x)
+        out = model(x)
+        logits = out[0] if isinstance(out, (tuple, list)) else out
         loss = F.cross_entropy(logits, y)
         loss.backward()
         optimizer.step()
@@ -213,7 +228,7 @@ def train_ce_epoch(model, loader, optimizer, device):
     return total_loss / total, correct / total
 
 
-def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight, device):
+def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight, lut4, lut6, device):
     model.train()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -259,7 +274,7 @@ def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight,
 
         loss_robust = dkl_loss(logits_nat, logits_adv, sample_weight, args.alpha, args.beta)
         out4, out6, _ = model(x_natural, return_aux=True)
-        loss_aux = aux_ce_loss(out4, out6, target, device)
+        loss_aux = aux_ce_loss(out4, out6, target, lut4, lut6)
         loss_natural = F.cross_entropy(logits_nat, target)
         loss = loss_natural + loss_robust + loss_aux
 
@@ -298,6 +313,9 @@ def test(model, loader, device):
 
 
 def main():
+    lut4 = build_lut(VEHICLE_CLASSES, device)
+    lut6 = build_lut(ANIMAL_CLASSES, device)
+
     resume_path = args.resume
     if resume_path == 'auto':
         resume_path = os.path.join(model_dir, 'checkpoint-last.pt')
@@ -319,36 +337,36 @@ def main():
                 warmup_start = 11
                 start_epoch_dkl = stage2_epoch - 10 + 1
 
-    m4 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=4).to(device)
-    m6 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=6).to(device)
+    m4 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=5).to(device)
+    m6 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=7).to(device)
 
     if resume_loaded and checkpoint is not None:
         m4.load_state_dict(checkpoint['m4_state_dict'])
         m6.load_state_dict(checkpoint['m6_state_dict'])
 
     if not resume_loaded:
-        print('==== Stage 1: Submodels (CE) ====')
+        print('==== Stage 1: Submodels (CE, 4+unk / 6+unk) ====')
         opt4 = optim.SGD(m4.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
         opt6 = optim.SGD(m6.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
         for ep in range(1, args.epochs_sub + 1):
             l4, a4 = train_ce_epoch(m4, train_loader_4, opt4, device)
             l6, a6 = train_ce_epoch(m6, train_loader_6, opt6, device)
-            print(f'[Sub][{ep}] 4c acc={a4*100:.2f}% | 6c acc={a6*100:.2f}%')
+            print(f'[Sub][{ep}] 4c+unk acc={a4*100:.2f}% | 6c+unk acc={a6*100:.2f}%')
         torch.save(m4.state_dict(), os.path.join(model_dir, 'wrn4_final.pt'))
         torch.save(m6.state_dict(), os.path.join(model_dir, 'wrn6_final.pt'))
 
-    fusion = GatedFusionWRN(m4, m6).to(device)
+    fusion = SoftRoutingConfidenceFusion(m4, m6, T=args.route_T, margin=args.route_margin).to(device)
     for p in fusion.parameters():
         p.requires_grad = True
 
     params = [
-        {'params': fusion.fc.parameters(), 'lr': args.lr},
         {'params': fusion.m4.parameters(), 'lr': args.lr},
         {'params': fusion.m6.parameters(), 'lr': args.lr},
-        {'params': fusion.gate.parameters(), 'lr': args.lr},
     ]
     optimizer = optim.SGD(params, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs_fusion, eta_min=0)
+    base_group_lrs = [pg['lr'] for pg in optimizer.param_groups]
+    milestones = [args.epochs_fusion // 2, int(args.epochs_fusion * 0.75)]
+    scheduler = MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
     ema = EMA(fusion, decay=0.999) if args.use_ema else None
 
     if resume_loaded and checkpoint is not None:
@@ -358,18 +376,24 @@ def main():
             n_cur, n_ckpt = len(optimizer.param_groups), len(ckpt_opt.get('param_groups', []))
             if n_cur == n_ckpt:
                 optimizer.load_state_dict(ckpt_opt)
-                print(f'[RESUME] optimizer loaded, lr={[pg["lr"] for pg in optimizer.param_groups]}')
+                base_group_lrs = [pg['lr'] for pg in optimizer.param_groups]
+                print(f'[RESUME] optimizer loaded, lr={base_group_lrs}')
             else:
                 print(f'[RESUME] optimizer param_groups mismatch (cur={n_cur}, ckpt={n_ckpt}), not loading')
-        if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
+        if 'scheduler_state_dict' in checkpoint and checkpoint.get('scheduler_state_dict') is not None:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            print(f'[RESUME] scheduler loaded')
+            actual_last = getattr(scheduler, 'last_epoch', getattr(scheduler, '_last_epoch', None))
+            stage2 = checkpoint.get('stage2_epoch', 0)
+            expected_last = (stage2 - 11) if stage2 > 10 else -1
+            print(f'[RESUME] scheduler loaded, last_epoch={actual_last}')
+            if actual_last is not None and expected_last >= 0 and actual_last != expected_last:
+                print(f'[RESUME] WARNING: scheduler last_epoch mismatch (actual={actual_last}, expected={expected_last})')
         if args.use_ema and 'ema_shadow' in checkpoint:
             ema.shadow = checkpoint['ema_shadow']
 
-    proxy_m4 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=4).to(device)
-    proxy_m6 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=6).to(device)
-    proxy_fusion = GatedFusionWRN(proxy_m4, proxy_m6).to(device)
+    proxy_m4 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=5).to(device)
+    proxy_m6 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=7).to(device)
+    proxy_fusion = SoftRoutingConfidenceFusion(proxy_m4, proxy_m6, T=args.route_T, margin=args.route_margin).to(device)
     proxy_optim = optim.SGD(proxy_fusion.parameters(), lr=args.lr)
     awp_adversary = TradesAWP(model=fusion, proxy=proxy_fusion, proxy_optim=proxy_optim, gamma=args.awp_gamma)
 
@@ -386,7 +410,6 @@ def main():
             optimizer.step()
             if ema is not None:
                 ema.update(fusion)
-        scheduler.step()
         print(f'[Warmup] Epoch {ep}/10')
         ckpt = {
             'm4_state_dict': m4.state_dict(),
@@ -398,6 +421,7 @@ def main():
             'stage2_epoch': ep,
         }
         torch.save(ckpt, os.path.join(model_dir, 'checkpoint-last.pt'))
+    base_group_lrs = [pg['lr'] for pg in optimizer.param_groups]
 
     freeze_bn(fusion)
 
@@ -410,20 +434,22 @@ def main():
     weight = None
     for ep in range(start_epoch_dkl, args.epochs_fusion + 1):
         ratio = backbone_lr_ratio(ep, args.epochs_fusion)
-        fusion_lr = optimizer.param_groups[0]['lr']
-        optimizer.param_groups[1]['lr'] = fusion_lr * ratio
-        optimizer.param_groups[2]['lr'] = fusion_lr * ratio
-        optimizer.param_groups[3]['lr'] = fusion_lr
+        for i, pg in enumerate(optimizer.param_groups):
+            pg['lr'] = base_group_lrs[i] * ratio
 
         loss_avg, acc_avg, weight = train_dkl_epoch(
-            fusion, train_loader_10, optimizer, ep, awp_adversary, ema, weight, device
+            fusion, train_loader_10, optimizer, ep, awp_adversary, ema, weight, lut4, lut6, device
         )
-        scheduler.step()
 
         if not bn_unfrozen and ep >= 40:
             unfreeze_bn(fusion)
             bn_unfrozen = True
             print(f'[INFO] Unfroze BN at epoch {ep}')
+
+        for i, pg in enumerate(optimizer.param_groups):
+            pg['lr'] = base_group_lrs[i]
+        scheduler.step()
+        base_group_lrs = [pg['lr'] for pg in optimizer.param_groups]
 
         if ema is not None:
             ema.apply_to(fusion)
