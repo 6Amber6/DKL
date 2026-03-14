@@ -115,11 +115,12 @@ def aux_ce_loss(logits4, logits6, y, device, weight=0.02):
 
 def perturb_input(model, x_natural, step_size, epsilon, perturb_steps, weight, device):
     model.eval()
+    with torch.no_grad():
+        logits_nat = model(x_natural).detach()
     x_adv = x_natural.detach() + 0.001 * torch.randn(x_natural.shape, device=device).detach()
     for _ in range(perturb_steps):
         x_adv.requires_grad_(True)
         with torch.enable_grad():
-            logits_nat = model(x_natural)
             logits_adv = model(x_adv)
             loss_kl = dkl_loss(logits_nat, logits_adv, weight, 1.0, 0.0)
         grad = torch.autograd.grad(loss_kl, [x_adv])[0]
@@ -251,14 +252,13 @@ def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight,
             awp_adversary.perturb(awp)
 
         optimizer.zero_grad()
-        logits_nat = model(x_natural)
+        out4, out6, logits_nat = model(x_natural, return_aux=True)
         logits_adv = model(x_adv)
 
         with torch.no_grad():
             WEIGHT = WEIGHT + (onehot.t() @ F.softmax(logits_nat.clone().detach() / args.T, dim=-1))
 
         loss_robust = dkl_loss(logits_nat, logits_adv, sample_weight, args.alpha, args.beta)
-        out4, out6, _ = model(x_natural, return_aux=True)
         loss_aux = aux_ce_loss(out4, out6, target, device)
         loss_natural = F.cross_entropy(logits_nat, target)
         loss = loss_natural + loss_robust + loss_aux
@@ -281,7 +281,8 @@ def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight,
         bar.next()
     bar.finish()
 
-    WEIGHT = WEIGHT / WEIGHT.sum(dim=1, keepdim=True) * 1.0 + weight * 0.0
+    row_sum = WEIGHT.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    WEIGHT = WEIGHT / row_sum
     return losses.avg, top1.avg, WEIGHT
 
 
@@ -304,20 +305,20 @@ def main():
 
     resume_loaded = False
     warmup_start = 1
-    start_epoch_dkl = 1
+    start_epoch_dkl = 11  # DKL ep 11~200 = 190 epochs (10 warmup + 190 DKL = 200 total)
     checkpoint = None
     if resume_path and os.path.isfile(resume_path):
         checkpoint = torch.load(resume_path, map_location=device)
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             print(f'[INFO] Resuming from {resume_path}')
             resume_loaded = True
-            stage2_epoch = checkpoint.get('stage2_epoch', 0)
-            if stage2_epoch <= 10:
-                warmup_start = stage2_epoch + 1
-                start_epoch_dkl = 1
+            fusion_epoch = checkpoint.get('fusion_epoch', checkpoint.get('stage2_epoch', 0))
+            if fusion_epoch < 10:
+                warmup_start = fusion_epoch + 1
+                start_epoch_dkl = 11
             else:
                 warmup_start = 11
-                start_epoch_dkl = stage2_epoch - 10 + 1
+                start_epoch_dkl = fusion_epoch + 1
 
     m4 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=4).to(device)
     m6 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=6).to(device)
@@ -395,7 +396,7 @@ def main():
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'ema_shadow': ema.shadow if ema is not None else {},
-            'stage2_epoch': ep,
+            'fusion_epoch': ep,
         }
         torch.save(ckpt, os.path.join(model_dir, 'checkpoint-last.pt'))
 
@@ -440,7 +441,7 @@ def main():
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'ema_shadow': ema.shadow if ema is not None else {},
-            'stage2_epoch': 10 + ep,
+            'fusion_epoch': ep,
         }
         torch.save(ckpt, os.path.join(model_dir, 'checkpoint-last.pt'))
 

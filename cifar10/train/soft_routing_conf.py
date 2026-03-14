@@ -2,7 +2,7 @@
 DKL-based Soft Routing Confidence WRN Training for CIFAR-10.
 Architecture: 4+1 (vehicle+unk) + 6+1 (animal+unk) submodels, confidence-based soft routing -> 10-class.
 Routing: w = softmax([c4, c6]/T), c4=1-P(unk4), c6=1-P(unk6).
-Fully aligned with DKL: 0-1 data, DKL loss, AWP, CosineAnnealingLR, save100_20.
+aligned with DKL: 0-1 data, DKL loss, AWP, save100_20.
 """
 from __future__ import print_function
 import os
@@ -54,24 +54,24 @@ class EMA:
                 p.data.copy_(self.backup[n])
 
 
-class CIFARUnknownDataset(torch.utils.data.Dataset):
-    def __init__(self, base_dataset, known_classes):
+class CIFARSubsetWithUnk(torch.utils.data.Dataset):
+    """Stage 1: 全10类数据，非本专家类统一映射为unk"""
+    def __init__(self, base_dataset, owned_classes, idx=None):
         self.base = base_dataset
-        self.known = list(known_classes)
-        self.map = {c: i for i, c in enumerate(self.known)}
-        self.known_set = set(self.known)
-        self.unknown_idx = len(self.known)
+        self.owned = list(owned_classes)
+        self.map = {c: i for i, c in enumerate(self.owned)}
+        self.owned_set = set(self.owned)
+        self.idx = idx if idx is not None else list(range(len(base_dataset)))
 
     def __len__(self):
-        return len(self.base)
+        return len(self.idx)
 
     def __getitem__(self, i):
-        x, y = self.base[i]
-        if y in self.known_set:
-            y = self.map[y]
+        x, y = self.base[self.idx[i]]
+        if y in self.owned_set:
+            return x, self.map[y]
         else:
-            y = self.unknown_idx
-        return x, y
+            return x, len(self.owned)  # unk label
 
 
 def freeze_bn(model):
@@ -107,27 +107,27 @@ def build_lut(classes, device_):
 
 
 def aux_ce_loss(logits4, logits6, y, lut4, lut6, weight=0.02):
+    """Aux CE: vehicle expert gets vehicle labels or Unknown(4); animal expert gets animal labels or Unknown(6)."""
     loss = 0.0
     if logits4 is not None:
-        idx4 = lut4[y]
-        m4 = idx4 != -1
-        if m4.any():
-            loss += F.cross_entropy(logits4[m4], idx4[m4])
+        target4 = lut4[y].clone()
+        target4[target4 == -1] = 4  # non-vehicle -> Unknown for vehicle expert
+        loss += F.cross_entropy(logits4, target4)
     if logits6 is not None:
-        idx6 = lut6[y]
-        m6 = idx6 != -1
-        if m6.any():
-            loss += F.cross_entropy(logits6[m6], idx6[m6])
+        target6 = lut6[y].clone()
+        target6[target6 == -1] = 6  # non-animal -> Unknown for animal expert
+        loss += F.cross_entropy(logits6, target6)
     return weight * loss
 
 
 def perturb_input(model, x_natural, step_size, epsilon, perturb_steps, weight, device):
     model.eval()
+    with torch.no_grad():
+        logits_nat = model(x_natural).detach()
     x_adv = x_natural.detach() + 0.001 * torch.randn(x_natural.shape, device=device).detach()
     for _ in range(perturb_steps):
         x_adv.requires_grad_(True)
         with torch.enable_grad():
-            logits_nat = model(x_natural)
             logits_adv = model(x_adv)
             loss_kl = dkl_loss(logits_nat, logits_adv, weight, 1.0, 0.0)
         grad = torch.autograd.grad(loss_kl, [x_adv])[0]
@@ -198,11 +198,11 @@ base_train_fusion = datasets.CIFAR10(root=args.data_path, train=True, download=T
 testset = datasets.CIFAR10(root=args.data_path, train=False, download=True, transform=transform_test)
 
 train_loader_4 = torch.utils.data.DataLoader(
-    CIFARUnknownDataset(base_train_sub, VEHICLE_CLASSES),
+    CIFARSubsetWithUnk(base_train_sub, VEHICLE_CLASSES),
     batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
 )
 train_loader_6 = torch.utils.data.DataLoader(
-    CIFARUnknownDataset(base_train_sub, ANIMAL_CLASSES),
+    CIFARSubsetWithUnk(base_train_sub, ANIMAL_CLASSES),
     batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
 )
 train_loader_10 = torch.utils.data.DataLoader(
@@ -266,14 +266,13 @@ def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight,
             awp_adversary.perturb(awp)
 
         optimizer.zero_grad()
-        logits_nat = model(x_natural)
+        out4, out6, logits_nat = model(x_natural, return_aux=True)
         logits_adv = model(x_adv)
 
         with torch.no_grad():
             WEIGHT = WEIGHT + (onehot.t() @ F.softmax(logits_nat.clone().detach() / args.T, dim=-1))
 
         loss_robust = dkl_loss(logits_nat, logits_adv, sample_weight, args.alpha, args.beta)
-        out4, out6, _ = model(x_natural, return_aux=True)
         loss_aux = aux_ce_loss(out4, out6, target, lut4, lut6)
         loss_natural = F.cross_entropy(logits_nat, target)
         loss = loss_natural + loss_robust + loss_aux
@@ -296,7 +295,8 @@ def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight,
         bar.next()
     bar.finish()
 
-    WEIGHT = WEIGHT / WEIGHT.sum(dim=1, keepdim=True) * 1.0 + weight * 0.0
+    row_sum = WEIGHT.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    WEIGHT = WEIGHT / row_sum
     return losses.avg, top1.avg, WEIGHT
 
 
@@ -322,20 +322,20 @@ def main():
 
     resume_loaded = False
     warmup_start = 1
-    start_epoch_dkl = 1
+    start_epoch_dkl = 11  # DKL ep 11~200 = 190 epochs (10 warmup + 190 DKL = 200 total)
     checkpoint = None
     if resume_path and os.path.isfile(resume_path):
         checkpoint = torch.load(resume_path, map_location=device)
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             print(f'[INFO] Resuming from {resume_path}')
             resume_loaded = True
-            stage2_epoch = checkpoint.get('stage2_epoch', 0)
-            if stage2_epoch <= 10:
-                warmup_start = stage2_epoch + 1
-                start_epoch_dkl = 1
+            fusion_epoch = checkpoint.get('fusion_epoch', checkpoint.get('stage2_epoch', 0))
+            if fusion_epoch < 10:
+                warmup_start = fusion_epoch + 1
+                start_epoch_dkl = 11
             else:
                 warmup_start = 11
-                start_epoch_dkl = stage2_epoch - 10 + 1
+                start_epoch_dkl = fusion_epoch + 1
 
     m4 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=5).to(device)
     m6 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=7).to(device)
@@ -363,9 +363,22 @@ def main():
         {'params': fusion.m4.parameters(), 'lr': args.lr},
         {'params': fusion.m6.parameters(), 'lr': args.lr},
     ]
+    opt_ids = set()
+    for g in params:
+        for p in g['params']:
+            opt_ids.add(id(p))
+    missing = [n for n, p in fusion.named_parameters() if p.requires_grad and id(p) not in opt_ids]
+    if missing:
+        raise RuntimeError(f"Missing trainable params in optimizer: {missing}")
     optimizer = optim.SGD(params, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     base_group_lrs = [pg['lr'] for pg in optimizer.param_groups]
-    milestones = [args.epochs_fusion // 2, int(args.epochs_fusion * 0.75)]
+    # scheduler.step() only in DKL (ep 11-200), not in warmup (ep 1-10). So step N = global epoch 10+N.
+    # To drop lr at global epoch 100 and 150, use milestones 90 and 140.
+    warmup_epochs = 10
+    milestones = [
+        args.epochs_fusion // 2 - warmup_epochs,
+        int(args.epochs_fusion * 0.75) - warmup_epochs,
+    ]
     scheduler = MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
     ema = EMA(fusion, decay=0.999) if args.use_ema else None
 
@@ -382,12 +395,7 @@ def main():
                 print(f'[RESUME] optimizer param_groups mismatch (cur={n_cur}, ckpt={n_ckpt}), not loading')
         if 'scheduler_state_dict' in checkpoint and checkpoint.get('scheduler_state_dict') is not None:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            actual_last = getattr(scheduler, 'last_epoch', getattr(scheduler, '_last_epoch', None))
-            stage2 = checkpoint.get('stage2_epoch', 0)
-            expected_last = (stage2 - 11) if stage2 > 10 else -1
-            print(f'[RESUME] scheduler loaded, last_epoch={actual_last}')
-            if actual_last is not None and expected_last >= 0 and actual_last != expected_last:
-                print(f'[RESUME] WARNING: scheduler last_epoch mismatch (actual={actual_last}, expected={expected_last})')
+            print(f'[RESUME] scheduler loaded')
         if args.use_ema and 'ema_shadow' in checkpoint:
             ema.shadow = checkpoint['ema_shadow']
 
@@ -418,7 +426,7 @@ def main():
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'ema_shadow': ema.shadow if ema is not None else {},
-            'stage2_epoch': ep,
+            'fusion_epoch': ep,
         }
         torch.save(ckpt, os.path.join(model_dir, 'checkpoint-last.pt'))
     base_group_lrs = [pg['lr'] for pg in optimizer.param_groups]
@@ -466,7 +474,7 @@ def main():
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'ema_shadow': ema.shadow if ema is not None else {},
-            'stage2_epoch': 10 + ep,
+            'fusion_epoch': ep,
         }
         torch.save(ckpt, os.path.join(model_dir, 'checkpoint-last.pt'))
 
