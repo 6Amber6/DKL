@@ -1,6 +1,7 @@
 # Run four noAWP training methods (no AWP, EMA)
 # Run from DKL project root. First set env:
 #   cd /DKL
+
 export ADV_DIR=$(pwd)/DKLv1/Adv-training-dkl
 export PYTHONPATH=$(pwd):$ADV_DIR:$PYTHONPATH
 

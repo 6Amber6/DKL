@@ -1,0 +1,39 @@
+# AutoAttack 评估四个 noAWP 方法 (epoch 100, 120, 140, 160, 180, 200)
+# 运行前: cd $ADV_DIR/auto_attacks, export PYTHONPATH=$PROJECT_ROOT:$ADV_DIR:$PYTHONPATH
+# ADV_DIR=$PROJECT_ROOT/DKLv1/Adv-training-dkl
+
+# ========== 1. parallel ==========
+for ep in 100 120 140 160 180 200; do
+  python -m cifar10.eval.parallel \
+    --checkpoint ../workdir/cifar10_parallel_noawp_a4b20t4_s6/fusion-epoch${ep}.pt \
+    --data CIFAR10 \
+    --preprocess '01' \
+    --log_path logs/cifar10_parallel_noawp_a4b20t4_s6_epoch${ep}.log
+done
+
+# ========== 2. gated ==========
+for ep in 100 120 140 160 180 200; do
+  python -m cifar10.eval.gated \
+    --checkpoint ../workdir/cifar10_gated_noawp_a4b20t4_s6/fusion-epoch${ep}.pt \
+    --data CIFAR10 \
+    --preprocess '01' \
+    --log_path logs/cifar10_gated_noawp_a4b20t4_s6_epoch${ep}.log
+done
+
+# ========== 3. soft_routing ==========
+for ep in 100 120 140 160 180 200; do
+  python -m cifar10.eval.soft_routing \
+    --checkpoint ../workdir/cifar10_soft_routing_noawp_a4b20t4_s6/fusion-epoch${ep}.pt \
+    --data CIFAR10 \
+    --preprocess '01' \
+    --log_path logs/cifar10_soft_routing_noawp_a4b20t4_s6_epoch${ep}.log
+done
+
+# ========== 4. soft_routing_conf ==========
+for ep in 100 120 140 160 180 200; do
+  python -m cifar10.eval.soft_routing_conf \
+    --checkpoint ../workdir/cifar10_soft_routing_conf_noawp_a4b20t4_s6/fusion-epoch${ep}.pt \
+    --data CIFAR10 \
+    --preprocess '01' \
+    --log_path logs/cifar10_soft_routing_conf_noawp_a4b20t4_s6_epoch${ep}.log
+done
