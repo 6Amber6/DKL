@@ -21,6 +21,7 @@ from cifar10.model.parallel_wrn import WRNWithEmbedding
 from cifar10.model.soft_routing_wrn import SoftRoutingFusion, VEHICLE_CLASSES, ANIMAL_CLASSES
 from utils import Bar, AverageMeter, accuracy
 from utils_awp import TradesAWP
+from autoaug import Cutout
 
 NUM_CLASSES = 10
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -180,7 +181,7 @@ torch.cuda.manual_seed(args.seed)
 model_dir = os.path.join(args.model_dir, args.mark)
 os.makedirs(model_dir, exist_ok=True)
 
-# DKL: 0-1 range, basic aug
+# DKL: 0-1 range. Stage 1: basic aug; Stage 2: basic + Cutout
 transform_sub = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
@@ -190,7 +191,9 @@ transform_fusion = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
+    Cutout(n_holes=1, length=8),
 ])
+
 transform_test = transforms.Compose([transforms.ToTensor()])
 
 base_train_sub = datasets.CIFAR10(root=args.data_path, train=True, download=True, transform=transform_sub)

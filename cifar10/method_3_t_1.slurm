@@ -49,6 +49,7 @@ python cifar10/train/soft_routing.py \
   --awp-warmup 10 \
   --save-start 100 \
   --save-freq 20 \
+  --route-T 1.0 \
   --seed 0
 
 echo "End time: $(date)"

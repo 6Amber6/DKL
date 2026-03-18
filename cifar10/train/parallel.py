@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(_root, 'DKLv1', 'Adv-training-dkl'))
 from cifar10.model.parallel_wrn import WRNWithEmbedding, ParallelFusionWRN
 from utils import Bar, Logger, AverageMeter, accuracy
 from utils_awp import TradesAWP
+from autoaug import Cutout
 
 # =========================================================
 # CIFAR-10 class split
@@ -206,18 +207,22 @@ model_dir = os.path.join(args.model_dir, args.mark)
 os.makedirs(model_dir, exist_ok=True)
 
 # =========================================================
-# Data (DKL style: 0-1 range, basic aug)
+# Data (unified aug: RandomCrop, RandomHorizontalFlip, Cutout)
 # =========================================================
+# Stage 1: basic aug for submodels
 transform_sub = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
 ])
+# Stage 2: basic + Cutout for fusion
 transform_fusion = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
+    Cutout(n_holes=1, length=8),
 ])
+
 transform_test = transforms.Compose([transforms.ToTensor()])
 
 base_train_sub = datasets.CIFAR10(root=args.data_path, train=True, download=True, transform=transform_sub)
