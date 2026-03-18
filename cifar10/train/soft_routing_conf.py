@@ -92,6 +92,8 @@ def unfreeze_bn(model):
 
 
 def dkl_loss(logits_nat, logits_adv, weight, alpha, beta):
+    logits_nat = torch.clamp(logits_nat, -50, 50)
+    logits_adv = torch.clamp(logits_adv, -50, 50)
     num_classes = logits_nat.size(1)
     delta_n = logits_nat.view(-1, num_classes, 1) - logits_nat.view(-1, 1, num_classes)
     delta_a = logits_adv.view(-1, num_classes, 1) - logits_adv.view(-1, 1, num_classes)
@@ -138,14 +140,9 @@ def perturb_input(model, x_natural, step_size, epsilon, perturb_steps, weight, d
     return x_adv
 
 
-def backbone_lr_ratio(epoch, total_epochs, r1=0.15, r2=0.5, r3=0.35):
-    p1 = max(1, int(total_epochs * 0.3))
-    p2 = max(p1 + 1, int(total_epochs * 0.7))
-    if epoch <= p1:
-        return r1
-    if epoch <= p2:
-        return r2
-    return r3
+def backbone_lr_ratio(epoch, total_epochs, r1=0.2, r2=0.2, r3=0.2):
+    """Fixed ratio 0.2 (same as TRADES gated)."""
+    return r1
 
 
 parser = argparse.ArgumentParser(description='DKL Soft Routing Confidence WRN CIFAR-10')
