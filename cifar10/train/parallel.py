@@ -390,10 +390,14 @@ def main():
         print('==== Stage 1: Submodels (CE) ====')
         opt4 = optim.SGD(m4.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
         opt6 = optim.SGD(m6.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+        sched4 = torch.optim.lr_scheduler.MultiStepLR(opt4, milestones=[60], gamma=0.1)
+        sched6 = torch.optim.lr_scheduler.MultiStepLR(opt6, milestones=[60], gamma=0.1)
         for ep in range(1, args.epochs_sub + 1):
             l4, a4 = train_ce_epoch(m4, train_loader_4, opt4, device)
             l6, a6 = train_ce_epoch(m6, train_loader_6, opt6, device)
-            print(f'[Sub][{ep}] 4c acc={a4*100:.2f}% | 6c acc={a6*100:.2f}%')
+            sched4.step()
+            sched6.step()
+            print(f'[Sub][{ep}] 4c acc={a4*100:.2f}% | 6c acc={a6*100:.2f}%, lr={opt4.param_groups[0]["lr"]:.6f}')
         torch.save(m4.state_dict(), os.path.join(model_dir, 'wrn4_final.pt'))
         torch.save(m6.state_dict(), os.path.join(model_dir, 'wrn6_final.pt'))
 
@@ -431,6 +435,8 @@ def main():
     proxy_m4 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=4).to(device)
     proxy_m6 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=6).to(device)
     proxy_fusion = ParallelFusionWRN(proxy_m4, proxy_m6).to(device)
+    for p in proxy_fusion.parameters():
+        p.requires_grad = True
     proxy_optim = optim.SGD(proxy_fusion.parameters(), lr=args.lr)
     awp_adversary = TradesAWP(model=fusion, proxy=proxy_fusion, proxy_optim=proxy_optim, gamma=args.awp_gamma)
 
