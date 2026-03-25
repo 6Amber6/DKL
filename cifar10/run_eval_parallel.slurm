@@ -33,12 +33,12 @@ export PYTHONPATH=$PROJECT_ROOT:$ADV_DIR:$PYTHONPATH
 export PYTHONUNBUFFERED=1
 
 echo "Now in: $(pwd)"
-echo "========== Eval Parallel Fusion (epoch 160) =========="
+echo "========== Eval Parallel Fusion (epoch 180) =========="
 
 stdbuf -oL python -u -m cifar10.eval.parallel \
-  --checkpoint ../workdir/cifar10_parallel_a4b20t4_s6/fusion-epoch160.pt \
+  --checkpoint ../workdir/cifar10_parallel_a4b20t4_s6/fusion-epoch180.pt \
   --data CIFAR10 \
   --preprocess '01' \
-  --log_path logs/cifar10_parallel_a4b20t4_s6_epoch160.log
+  --log_path logs/cifar10_parallel_a4b20t4_s6_epoch180.log
 
 echo "End time: $(date)"
