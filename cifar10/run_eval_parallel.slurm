@@ -32,12 +32,12 @@ mkdir -p logs
 export PYTHONPATH=$PROJECT_ROOT:$ADV_DIR:$PYTHONPATH
 
 echo "Now in: $(pwd)"
-echo "========== Eval Parallel Fusion (epoch 200) =========="
+echo "========== Eval Parallel Fusion (epoch 160) =========="
 
 python -m cifar10.eval.parallel \
-  --checkpoint ../workdir/cifar10_parallel_a4b20t4_s6/fusion-epoch200.pt \
+  --checkpoint ../workdir/cifar10_parallel_a4b20t4_s6/fusion-epoch160.pt \
   --data CIFAR10 \
   --preprocess '01' \
-  --log_path logs/cifar10_parallel_a4b20t4_s6_epoch200.log
+  --log_path logs/cifar10_parallel_a4b20t4_s6_epoch160.log
 
 echo "End time: $(date)"

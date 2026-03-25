@@ -33,7 +33,7 @@ echo "Now in: $(pwd)"
 export PYTHONPATH=$PROJECT_ROOT:$ADV_DIR:$PYTHONPATH
 
 python cifar10/train/parallel.py \
-  --epochs-sub 100 \
+  --epochs-sub 70 \
   --epochs-fusion 200 \
   --batch-size 128 \
   --lr 0.1 \
