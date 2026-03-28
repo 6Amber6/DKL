@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=eval_parallel_s6
+#SBATCH --job-name=eval_cifar100_parallel_s6
 #SBATCH --partition=DGXH200
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -33,20 +33,24 @@ export PYTHONPATH=$PROJECT_ROOT:$ADV_DIR:$PYTHONPATH
 export PYTHONUNBUFFERED=1
 
 echo "Now in: $(pwd)"
-echo "========== Eval Parallel Fusion (best) =========="
+echo "========== Eval Parallel Fusion CIFAR-100 (best) =========="
 
-stdbuf -oL python -u -m cifar10.eval.parallel \
-  --checkpoint ../workdir/cifar10_parallel_a4b20t4_s6/fusion-best.pt \
-  --data CIFAR10 \
+stdbuf -oL python -u -m cifar100.eval.parallel \
+  --checkpoint ../workdir/cifar100_parallel_a4b20t4_s6/fusion-best.pt \
+  --data-dir $ADV_DIR/../data \
   --preprocess '01' \
-  --log_path logs/cifar10_parallel_a4b20t4_s6_best.log
+  --sub-depth 34 \
+  --sub-widen 10 \
+  --log_path logs/cifar100_parallel_a4b20t4_s6_best.log
 
-echo "========== Eval Parallel Fusion (last) =========="
+echo "========== Eval Parallel Fusion CIFAR-100 (last) =========="
 
-stdbuf -oL python -u -m cifar10.eval.parallel \
-  --checkpoint ../workdir/cifar10_parallel_a4b20t4_s6/fusion-last.pt \
-  --data CIFAR10 \
+stdbuf -oL python -u -m cifar100.eval.parallel \
+  --checkpoint ../workdir/cifar100_parallel_a4b20t4_s6/fusion-last.pt \
+  --data-dir $ADV_DIR/../data \
   --preprocess '01' \
-  --log_path logs/cifar10_parallel_a4b20t4_s6_last.log
+  --sub-depth 34 \
+  --sub-widen 10 \
+  --log_path logs/cifar100_parallel_a4b20t4_s6_last.log
 
 echo "End time: $(date)"

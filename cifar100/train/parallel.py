@@ -1,11 +1,19 @@
 """
-DKL-based Parallel WRN Training for CIFAR-10.
-Architecture: 4-class (vehicle) + 6-class (animal) submodels with fusion for 10-class.
+DKL-based Parallel WRN Training for CIFAR-100.
+Architecture: 4-group submodels (by coarse superclass) with fusion for 100-class.
 
 Loss: L = L_nat + L_robust + L_aux.
   L_nat = CE(logits_nat, y).
-  L_robust = DKL: beta * MSE(delta_nat - delta_adv) + alpha * SCE(p_nat || p_adv), with sample weight.
-  L_aux = 0.02 * (CE on 4-class head for vehicle + CE on 6-class head for animal).
+  L_robust = DKL: beta * wMSE(delta_nat - delta_adv) + alpha * SCE(p_nat || p_adv).
+  L_aux = 0.02 * sum(CE on each group head for its classes).
+
+Aligned with DKL baseline (train_dkl_cifar100.py):
+  - raw [0,1] input (no mean/std normalize)
+  - DKL loss with sample_weight (pairwise class prior)
+  - progressive epsilon warmup + progressive PGD steps
+  - AWP (Adversarial Weight Perturbation)
+  - cosine annealing LR (scheduler starts after warmup)
+  - WEIGHT update with temperature T
 """
 from __future__ import print_function
 import os
@@ -19,24 +27,53 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import transforms, datasets
 
-# Add DKL root for cifar10.model, then Adv-training-dkl for utils/utils_awp
+# Add DKL root for cifar100.model, then Adv-training-dkl for utils/utils_awp
 _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _root)
 sys.path.insert(0, os.path.join(_root, 'DKLv1', 'Adv-training-dkl'))
-from cifar10.model.parallel_wrn import WRNWithEmbedding, ParallelFusionWRN
+from cifar100.model.parallel_wrn import ParallelFusionWRN100
+from cifar10.model.parallel_wrn import WRNWithEmbedding
 from utils import Bar, Logger, AverageMeter, accuracy
 from utils_awp import TradesAWP
 from autoaug import Cutout
 
-# =========================================================
-# CIFAR-10 class split
-# =========================================================
-VEHICLE_CLASSES = [0, 1, 8, 9]
-ANIMAL_CLASSES = [2, 3, 4, 5, 6, 7]
 
 # =========================================================
-# DKL uses 0-1 range (no mean/std normalize in transform)
+# CIFAR-100 fine -> coarse mapping (standard 20 superclasses)
 # =========================================================
+CIFAR100_FINE_TO_COARSE = [
+    4, 1, 14, 8, 0, 6, 7, 7, 18, 3,
+    3, 14, 9, 18, 7, 11, 3, 9, 7, 11,
+    6, 11, 5, 10, 7, 6, 13, 15, 3, 15,
+    0, 11, 1, 10, 12, 14, 16, 9, 11, 5,
+    5, 19, 8, 8, 15, 13, 14, 17, 18, 10,
+    16, 4, 17, 4, 2, 0, 17, 4, 18, 17,
+    10, 3, 2, 12, 12, 16, 12, 1, 9, 19,
+    2, 10, 0, 1, 16, 12, 9, 13, 15, 13,
+    16, 19, 2, 4, 6, 19, 5, 5, 8, 19,
+    18, 1, 2, 15, 6, 0, 17, 8, 14, 13,
+]
+
+# =========================================================
+# Meta-groups by coarse class IDs
+# =========================================================
+COARSE_GROUPS = {
+    "textured_organic": [7, 15, 16, 8, 13],
+    "smooth_organic": [1, 0, 11, 12, 14],
+    "rigid_manmade": [6, 5, 3, 18, 9],
+    "large_structures": [10, 17, 19, 2, 4],
+}
+GROUP_ORDER = ["textured_organic", "smooth_organic", "rigid_manmade", "large_structures"]
+
+NUM_CLASSES = 100
+
+
+def build_fine_classes_for_group(group_coarse):
+    return sorted([i for i, c in enumerate(CIFAR100_FINE_TO_COARSE) if c in group_coarse])
+
+
+GROUP_FINE = [build_fine_classes_for_group(COARSE_GROUPS[name]) for name in GROUP_ORDER]
+
 
 # =========================================================
 # EMA
@@ -69,15 +106,15 @@ class EMA:
 
 
 # =========================================================
-# Dataset wrapper
+# Dataset wrapper for fine labels
 # =========================================================
-class CIFARSubset(torch.utils.data.Dataset):
-    def __init__(self, base_dataset, keep_classes):
+class CIFARFineSubset(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, keep_fine_classes):
         self.base = base_dataset
-        self.map = {c: i for i, c in enumerate(keep_classes)}
+        self.map = {c: i for i, c in enumerate(keep_fine_classes)}
         targets = torch.tensor(self.base.targets)
         self.idx = (
-            (targets.unsqueeze(1) == torch.tensor(keep_classes))
+            (targets.unsqueeze(1) == torch.tensor(keep_fine_classes))
             .any(dim=1).nonzero(as_tuple=False).view(-1)
         )
 
@@ -86,7 +123,7 @@ class CIFARSubset(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         x, y = self.base[self.idx[i]]
-        return x, self.map[y]
+        return x, self.map[int(y)]
 
 
 # =========================================================
@@ -108,7 +145,7 @@ def unfreeze_bn(model):
 
 
 # =========================================================
-# DKL loss (from Adv-training-dkl)
+# DKL loss (aligned with baseline)
 # =========================================================
 def dkl_loss(logits_nat, logits_adv, weight, alpha, beta):
     num_classes = logits_nat.size(1)
@@ -120,36 +157,32 @@ def dkl_loss(logits_nat, logits_adv, weight, alpha, beta):
 
 
 # =========================================================
-# Aux loss (vehicle/animal sub-logits)
+# Aux loss (per-group sub-logits)
 # =========================================================
-def aux_ce_loss(logits4, logits6, y, device, weight=0.02):
+def aux_ce_loss(aux_outputs, y, device, weight=0.02):
     loss = 0.0
-    if logits4 is not None:
-        mask4 = torch.isin(y, torch.tensor(VEHICLE_CLASSES, device=device))
-        if mask4.any():
-            remap4 = torch.tensor(VEHICLE_CLASSES, device=device)
-            loss += F.cross_entropy(logits4[mask4], torch.searchsorted(remap4, y[mask4]))
-    if logits6 is not None:
-        mask6 = torch.isin(y, torch.tensor(ANIMAL_CLASSES, device=device))
-        if mask6.any():
-            remap6 = torch.tensor(ANIMAL_CLASSES, device=device)
-            loss += F.cross_entropy(logits6[mask6], torch.searchsorted(remap6, y[mask6]))
+    for group_idx, logits_g in enumerate(aux_outputs):
+        if logits_g is None:
+            continue
+        fine_classes = torch.tensor(GROUP_FINE[group_idx], device=device)
+        mask = torch.isin(y, fine_classes)
+        if mask.any():
+            loss += F.cross_entropy(logits_g[mask], torch.searchsorted(fine_classes, y[mask]))
     return weight * loss
 
 
 # =========================================================
-# Adversarial perturbation (DKL style)
+# Adversarial perturbation (DKL style, aligned with baseline)
 # =========================================================
 def perturb_input(model, x_natural, step_size, epsilon, perturb_steps, weight, device):
     model.eval()
-    with torch.no_grad():
-        logits_nat = model(x_natural).detach()
     x_adv = x_natural.detach() + 0.001 * torch.randn(x_natural.shape, device=device).detach()
     for _ in range(perturb_steps):
         x_adv.requires_grad_(True)
         with torch.enable_grad():
+            logits_nat = model(x_natural)
             logits_adv = model(x_adv)
-            loss_kl = dkl_loss(logits_nat, logits_adv, weight, 1.0, 0.0)
+            loss_kl = dkl_loss(logits_nat, logits_adv, weight, 1.0, 1.0)
         grad = torch.autograd.grad(loss_kl, [x_adv])[0]
         x_adv = x_adv.detach() + step_size * torch.sign(grad.detach())
         x_adv = torch.min(torch.max(x_adv, x_natural - epsilon), x_natural + epsilon)
@@ -158,24 +191,22 @@ def perturb_input(model, x_natural, step_size, epsilon, perturb_steps, weight, d
 
 
 # =========================================================
-# Backbone LR ratio
+# Backbone LR ratio (smooth linear ramp)
 # =========================================================
 def backbone_lr_ratio(epoch, total_epochs, r1=0.15, r2=0.5, r3=0.35):
-    p1 = int(total_epochs * 0.4)   # ramp up end
-    p2 = int(total_epochs * 0.7)   # ramp down start
+    p1 = int(total_epochs * 0.4)
+    p2 = int(total_epochs * 0.7)
     if epoch <= p1:
-        # linear ramp: r1 -> r2 over [1, p1]
         return r1 + (r2 - r1) * (epoch - 1) / max(p1 - 1, 1)
     if epoch <= p2:
         return r2
-    # linear ramp: r2 -> r3 over [p2+1, total_epochs]
     return r2 + (r3 - r2) * (epoch - p2) / max(total_epochs - p2, 1)
 
 
 # =========================================================
 # Arguments
 # =========================================================
-parser = argparse.ArgumentParser(description='DKL Parallel WRN CIFAR-10')
+parser = argparse.ArgumentParser(description='DKL Parallel WRN CIFAR-100')
 parser.add_argument('--epochs-sub', type=int, default=100)
 parser.add_argument('--epochs-fusion', type=int, default=200)
 parser.add_argument('--batch-size', type=int, default=128)
@@ -186,19 +217,20 @@ parser.add_argument('--epsilon', type=float, default=8/255)
 parser.add_argument('--alpha', type=float, default=4.0)
 parser.add_argument('--beta', type=float, default=20.0)
 parser.add_argument('--T', type=float, default=4.0)
-parser.add_argument('--train_budget', type=str, default='high', choices=['low', 'high'])
+parser.add_argument('--train_budget', type=str, default='low', choices=['low', 'high'])
+parser.add_argument('--sub-depth', type=int, default=34, choices=[28, 34])
+parser.add_argument('--sub-widen', type=int, default=10, choices=[4, 8, 10])
 parser.add_argument('--model-dir', default='./workdir')
-parser.add_argument('--mark', type=str, default='parallel')
+parser.add_argument('--mark', type=str, default='cifar100_parallel')
 parser.add_argument('--data-path', type=str, default='../data')
 parser.add_argument('--awp-gamma', type=float, default=0.005)
 parser.add_argument('--awp-warmup', type=int, default=10)
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--resume', default='auto', help='path to checkpoint or "auto" for model_dir/checkpoint-last.pt')
-parser.add_argument('--use-ema', action='store_true', default=True, help='use EMA of weights (default: True)')
-parser.add_argument('--no-ema', action='store_false', dest='use_ema', help='disable EMA (e.g. for DKL-style SWA later)')
+parser.add_argument('--resume', default='auto', help='path to checkpoint or "auto"')
+parser.add_argument('--use-ema', action='store_true', default=True)
+parser.add_argument('--no-ema', action='store_false', dest='use_ema')
 args = parser.parse_args()
 
-NUM_CLASSES = 10
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
@@ -207,50 +239,46 @@ model_dir = os.path.join(args.model_dir, args.mark)
 os.makedirs(model_dir, exist_ok=True)
 
 # =========================================================
-# Data (unified aug: RandomCrop, RandomHorizontalFlip, Cutout)
+# Data: raw [0,1] (aligned with DKL baseline, no mean/std)
 # =========================================================
-# Stage 1: basic aug for submodels
 transform_sub = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
     transforms.RandAugment(num_ops=1, magnitude=5),
     transforms.ToTensor(),
 ])
-# Stage 2: basic + Cutout for fusion
 transform_fusion = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
-    transforms.RandAugment(num_ops=2, magnitude=7),
+    transforms.RandAugment(num_ops=2, magnitude=5),
     transforms.ToTensor(),
     Cutout(n_holes=1, length=16),
 ])
-
 transform_test = transforms.Compose([transforms.ToTensor()])
 
-base_train_sub = datasets.CIFAR10(root=args.data_path, train=True, download=True, transform=transform_sub)
-base_train_fusion = datasets.CIFAR10(root=args.data_path, train=True, download=True, transform=transform_fusion)
-testset = datasets.CIFAR10(root=args.data_path, train=False, download=True, transform=transform_test)
+base_train_sub = datasets.CIFAR100(root=args.data_path, train=True, download=True, transform=transform_sub)
+base_train_fusion = datasets.CIFAR100(root=args.data_path, train=True, download=True, transform=transform_fusion)
+testset = datasets.CIFAR100(root=args.data_path, train=False, download=True, transform=transform_test)
 
-train_loader_4 = torch.utils.data.DataLoader(
-    CIFARSubset(base_train_sub, VEHICLE_CLASSES),
-    batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
-)
-train_loader_6 = torch.utils.data.DataLoader(
-    CIFARSubset(base_train_sub, ANIMAL_CLASSES),
-    batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
-)
-train_loader_10 = torch.utils.data.DataLoader(
+group_loaders = []
+for fine_classes in GROUP_FINE:
+    loader = torch.utils.data.DataLoader(
+        CIFARFineSubset(base_train_sub, fine_classes),
+        batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
+    )
+    group_loaders.append(loader)
+
+train_loader_100 = torch.utils.data.DataLoader(
     base_train_fusion, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
 )
-test_loader = torch.utils.data.DataLoader(testset, batch_size=128, shuffle=False, num_workers=4)
-test_loader_4 = torch.utils.data.DataLoader(
-    CIFARSubset(testset, VEHICLE_CLASSES),
-    batch_size=128, shuffle=False, num_workers=4
-)
-test_loader_6 = torch.utils.data.DataLoader(
-    CIFARSubset(testset, ANIMAL_CLASSES),
-    batch_size=128, shuffle=False, num_workers=4
-)
+test_loader = torch.utils.data.DataLoader(testset, batch_size=200, shuffle=False, num_workers=4)
+
+group_test_loaders = []
+for fine_classes in GROUP_FINE:
+    group_test_loaders.append(torch.utils.data.DataLoader(
+        CIFARFineSubset(testset, fine_classes),
+        batch_size=200, shuffle=False, num_workers=4
+    ))
 
 
 # =========================================================
@@ -314,14 +342,14 @@ def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight,
             awp_adversary.perturb(awp)
 
         optimizer.zero_grad()
-        out4, out6, logits_nat = model(x_natural, return_aux=True)
+        aux_outputs, logits_nat = model(x_natural, return_aux=True)
         logits_adv = model(x_adv)
 
         with torch.no_grad():
             WEIGHT = WEIGHT + (onehot.t() @ F.softmax(logits_nat.clone().detach() / args.T, dim=-1))
 
         loss_robust = dkl_loss(logits_nat, logits_adv, sample_weight, args.alpha, args.beta)
-        loss_aux = aux_ce_loss(out4, out6, target, device)
+        loss_aux = aux_ce_loss(aux_outputs, target, device)
         loss_natural = F.cross_entropy(logits_nat, target)
         loss = loss_natural + loss_robust + loss_aux
 
@@ -398,14 +426,14 @@ def main():
 
     resume_loaded = False
     warmup_start = 1
-    start_epoch_dkl = 11  # DKL ep 11~200 = 190 epochs (10 warmup + 190 DKL = 200 total)
+    start_epoch_dkl = 11
     checkpoint = None
     if resume_path and os.path.isfile(resume_path):
         checkpoint = torch.load(resume_path, map_location=device)
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             print(f'[INFO] Resuming from {resume_path}')
             resume_loaded = True
-            fusion_epoch = checkpoint.get('fusion_epoch', checkpoint.get('stage2_epoch', 0))
+            fusion_epoch = checkpoint.get('fusion_epoch', 0)
             if fusion_epoch < 10:
                 warmup_start = fusion_epoch + 1
                 start_epoch_dkl = 11
@@ -413,41 +441,50 @@ def main():
                 warmup_start = 11
                 start_epoch_dkl = fusion_epoch + 1
 
-    # Stage 1: Submodels (skip if resume and have ckpt)
-    m4 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=4).to(device)
-    m6 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=6).to(device)
+    # Stage 1: Submodels
+    group_names = GROUP_ORDER
+    submodels = []
+    stage1_files = [os.path.join(model_dir, f'wrn_{name}_final.pt') for name in group_names]
+    stage1_done = resume_loaded or all(os.path.isfile(f) for f in stage1_files)
 
-    if resume_loaded and checkpoint is not None:
-        m4.load_state_dict(checkpoint['m4_state_dict'])
-        m6.load_state_dict(checkpoint['m6_state_dict'])
-
-    if not resume_loaded:
+    if stage1_done and not resume_loaded:
+        print('==== Stage 1: Loading saved submodels ====')
+        for i, name in enumerate(group_names):
+            m = WRNWithEmbedding(depth=args.sub_depth, widen_factor=args.sub_widen,
+                                 num_classes=len(GROUP_FINE[i])).to(device)
+            m.load_state_dict(torch.load(stage1_files[i], map_location=device))
+            submodels.append(m)
+            print(f'  Loaded {name} ({len(GROUP_FINE[i])} classes)')
+    elif not resume_loaded:
         print('==== Stage 1: Submodels (CE) ====')
-        opt4 = optim.SGD(m4.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-        opt6 = optim.SGD(m6.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-        sched4 = torch.optim.lr_scheduler.MultiStepLR(opt4, milestones=[60], gamma=0.1)
-        sched6 = torch.optim.lr_scheduler.MultiStepLR(opt6, milestones=[60], gamma=0.1)
-        for ep in range(1, args.epochs_sub + 1):
-            l4, a4 = train_ce_epoch(m4, train_loader_4, opt4, device)
-            l6, a6 = train_ce_epoch(m6, train_loader_6, opt6, device)
-            sched4.step()
-            sched6.step()
-            t4 = test(m4, test_loader_4, device)
-            t6 = test(m6, test_loader_6, device)
-            print(f'[Sub][{ep}] 4c train={a4*100:.2f}% test={t4*100:.2f}% | 6c train={a6*100:.2f}% test={t6*100:.2f}%, lr={opt4.param_groups[0]["lr"]:.6f}')
-        torch.save(m4.state_dict(), os.path.join(model_dir, 'wrn4_final.pt'))
-        torch.save(m6.state_dict(), os.path.join(model_dir, 'wrn6_final.pt'))
+        for i, loader in enumerate(group_loaders):
+            m = WRNWithEmbedding(depth=args.sub_depth, widen_factor=args.sub_widen,
+                                 num_classes=len(GROUP_FINE[i])).to(device)
+            opt = optim.SGD(m.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+            sched = CosineAnnealingLR(opt, T_max=args.epochs_sub, eta_min=0.01)
+            for ep in range(1, args.epochs_sub + 1):
+                _, a = train_ce_epoch(m, loader, opt, device)
+                sched.step()
+                t_acc = test(m, group_test_loaders[i], device)
+                print(f'[Sub][{ep}] {group_names[i]} train={a*100:.2f}% test={t_acc*100:.2f}%, lr={opt.param_groups[0]["lr"]:.6f}')
+            torch.save(m.state_dict(), stage1_files[i])
+            submodels.append(m)
+            print(f'  Saved {group_names[i]} -> {stage1_files[i]}')
+    else:
+        # resume_loaded: create placeholder submodels, will be loaded from checkpoint
+        for i in range(len(group_names)):
+            m = WRNWithEmbedding(depth=args.sub_depth, widen_factor=args.sub_widen,
+                                 num_classes=len(GROUP_FINE[i])).to(device)
+            submodels.append(m)
 
     # Stage 2: Fusion + DKL
-    fusion = ParallelFusionWRN(m4, m6).to(device)
+    fusion = ParallelFusionWRN100(submodels, num_classes=NUM_CLASSES, freeze_backbone=False).to(device)
     for p in fusion.parameters():
         p.requires_grad = True
 
-    params = [
-        {'params': fusion.fc.parameters(), 'lr': args.lr},
-        {'params': fusion.m4.parameters(), 'lr': args.lr},
-        {'params': fusion.m6.parameters(), 'lr': args.lr},
-    ]
+    params = [{'params': fusion.fc.parameters(), 'lr': args.lr}]
+    for m in fusion.submodels:
+        params.append({'params': m.parameters(), 'lr': args.lr})
     optimizer = optim.SGD(params, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs_fusion - 10, eta_min=0)
     ema = EMA(fusion, decay=0.999) if args.use_ema else None
@@ -459,19 +496,20 @@ def main():
             n_cur, n_ckpt = len(optimizer.param_groups), len(ckpt_opt.get('param_groups', []))
             if n_cur == n_ckpt:
                 optimizer.load_state_dict(ckpt_opt)
-                print(f'[RESUME] optimizer loaded, lr={[pg["lr"] for pg in optimizer.param_groups]}')
+                print(f'[RESUME] optimizer loaded')
             else:
-                print(f'[RESUME] optimizer param_groups mismatch (cur={n_cur}, ckpt={n_ckpt}), not loading')
+                print(f'[RESUME] optimizer param_groups mismatch (cur={n_cur}, ckpt={n_ckpt}), skip')
         if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             print(f'[RESUME] scheduler loaded')
-        if args.use_ema and 'ema_shadow' in checkpoint:
+        if args.use_ema and ema is not None and 'ema_shadow' in checkpoint:
             ema.shadow = checkpoint['ema_shadow']
 
     # Proxy for AWP
-    proxy_m4 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=4).to(device)
-    proxy_m6 = WRNWithEmbedding(depth=34, widen_factor=10, num_classes=6).to(device)
-    proxy_fusion = ParallelFusionWRN(proxy_m4, proxy_m6).to(device)
+    proxy_subs = [WRNWithEmbedding(depth=args.sub_depth, widen_factor=args.sub_widen,
+                                    num_classes=len(GROUP_FINE[i])).to(device)
+                  for i in range(len(group_names))]
+    proxy_fusion = ParallelFusionWRN100(proxy_subs, num_classes=NUM_CLASSES, freeze_backbone=False).to(device)
     for p in proxy_fusion.parameters():
         p.requires_grad = True
     proxy_optim = optim.SGD(proxy_fusion.parameters(), lr=args.lr)
@@ -481,7 +519,7 @@ def main():
     print('==== CE warmup (10 epochs) ====')
     for ep in range(warmup_start, 11):
         fusion.train()
-        for x, y in train_loader_10:
+        for x, y in train_loader_100:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             out = fusion(x)
@@ -493,8 +531,6 @@ def main():
                 ema.update(fusion)
         print(f'[Warmup] Epoch {ep}/10')
         ckpt = {
-            'm4_state_dict': m4.state_dict(),
-            'm6_state_dict': m6.state_dict(),
             'model_state_dict': fusion.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
@@ -519,11 +555,11 @@ def main():
     for ep in range(start_epoch_dkl, args.epochs_fusion + 1):
         ratio = backbone_lr_ratio(ep, args.epochs_fusion)
         fusion_lr = optimizer.param_groups[0]['lr']
-        optimizer.param_groups[1]['lr'] = fusion_lr * ratio
-        optimizer.param_groups[2]['lr'] = fusion_lr * ratio
+        for g in range(1, len(optimizer.param_groups)):
+            optimizer.param_groups[g]['lr'] = fusion_lr * ratio
 
         loss_avg, acc_avg, weight = train_dkl_epoch(
-            fusion, train_loader_10, optimizer, ep, awp_adversary, ema, weight, device
+            fusion, train_loader_100, optimizer, ep, awp_adversary, ema, weight, device
         )
         scheduler.step()
 
@@ -553,8 +589,6 @@ def main():
 
         # Save last checkpoint (for resume)
         ckpt = {
-            'm4_state_dict': m4.state_dict(),
-            'm6_state_dict': m6.state_dict(),
             'model_state_dict': fusion.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),

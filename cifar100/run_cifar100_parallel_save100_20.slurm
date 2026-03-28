@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=parallel_cifar10_s6
-#SBATCH --partition=DGXA100
+#SBATCH --job-name=parallel_cifar100_s6
+#SBATCH --partition=DGXH200
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
@@ -32,18 +32,20 @@ echo "Now in: $(pwd)"
 
 export PYTHONPATH=$PROJECT_ROOT:$ADV_DIR:$PYTHONPATH
 
-python cifar10/train/parallel.py \
-  --epochs-sub 70 \
+python cifar100/train/parallel.py \
+  --epochs-sub 100 \
   --epochs-fusion 200 \
   --batch-size 128 \
-  --lr 0.1 \
+  --lr 0.2 \
   --epsilon 0.031372549 \
   --alpha 4.0 \
   --beta 20.0 \
   --T 4.0 \
   --train_budget high \
+  --sub-depth 34 \
+  --sub-widen 10 \
   --model-dir $ADV_DIR/workdir \
-  --mark cifar10_parallel_a4b20t4_s6 \
+  --mark cifar100_parallel_a4b20t4_s6 \
   --data-path $ADV_DIR/../data \
   --awp-gamma 0.005 \
   --awp-warmup 10 \
