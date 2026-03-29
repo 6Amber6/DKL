@@ -303,7 +303,7 @@ def train_ce_epoch(model, loader, optimizer, device):
 # =========================================================
 # Train DKL epoch (Stage 2)
 # =========================================================
-def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight, device):
+def train_dkl_epoch(model, raw_model, loader, optimizer, epoch, awp_adversary, ema, weight, device):
     model.train()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -361,7 +361,7 @@ def train_dkl_epoch(model, loader, optimizer, epoch, awp_adversary, ema, weight,
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         if ema is not None:
-            ema.update(model)
+            ema.update(raw_model)
 
         if epoch >= args.awp_warmup:
             awp_adversary.restore(awp)
@@ -482,15 +482,22 @@ def main():
     for p in fusion.parameters():
         p.requires_grad = True
 
-    params = [{'params': fusion.fc.parameters(), 'lr': args.lr}]
-    for m in fusion.submodels:
+    # Multi-GPU DataParallel
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        fusion = nn.DataParallel(fusion)
+        print(f'[INFO] Using {n_gpus} GPUs via DataParallel')
+    raw_model = fusion.module if hasattr(fusion, 'module') else fusion
+
+    params = [{'params': raw_model.fc.parameters(), 'lr': args.lr}]
+    for m in raw_model.submodels:
         params.append({'params': m.parameters(), 'lr': args.lr})
     optimizer = optim.SGD(params, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs_fusion - 10, eta_min=0)
-    ema = EMA(fusion, decay=0.999) if args.use_ema else None
+    ema = EMA(raw_model, decay=0.999) if args.use_ema else None
 
     if resume_loaded and checkpoint is not None:
-        fusion.load_state_dict(checkpoint['model_state_dict'])
+        raw_model.load_state_dict(checkpoint['model_state_dict'])
         if 'optimizer_state_dict' in checkpoint:
             ckpt_opt = checkpoint['optimizer_state_dict']
             n_cur, n_ckpt = len(optimizer.param_groups), len(ckpt_opt.get('param_groups', []))
@@ -512,6 +519,8 @@ def main():
     proxy_fusion = ParallelFusionWRN100(proxy_subs, num_classes=NUM_CLASSES, freeze_backbone=False).to(device)
     for p in proxy_fusion.parameters():
         p.requires_grad = True
+    if n_gpus > 1:
+        proxy_fusion = nn.DataParallel(proxy_fusion)
     proxy_optim = optim.SGD(proxy_fusion.parameters(), lr=args.lr)
     awp_adversary = TradesAWP(model=fusion, proxy=proxy_fusion, proxy_optim=proxy_optim, gamma=args.awp_gamma)
 
@@ -528,10 +537,10 @@ def main():
             torch.nn.utils.clip_grad_norm_(fusion.parameters(), 5.0)
             optimizer.step()
             if ema is not None:
-                ema.update(fusion)
+                ema.update(raw_model)
         print(f'[Warmup] Epoch {ep}/10')
         ckpt = {
-            'model_state_dict': fusion.state_dict(),
+            'model_state_dict': raw_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'ema_shadow': ema.shadow if ema is not None else {},
@@ -559,7 +568,7 @@ def main():
             optimizer.param_groups[g]['lr'] = fusion_lr * ratio
 
         loss_avg, acc_avg, weight = train_dkl_epoch(
-            fusion, train_loader_100, optimizer, ep, awp_adversary, ema, weight, device
+            fusion, raw_model, train_loader_100, optimizer, ep, awp_adversary, ema, weight, device
         )
         scheduler.step()
 
@@ -569,7 +578,7 @@ def main():
             print(f'[INFO] Unfroze BN at epoch {ep}')
 
         if ema is not None:
-            ema.apply_to(fusion)
+            ema.apply_to(raw_model)
         val_acc = test(fusion, test_loader, device)
 
         # PGD-40 every 10 epochs and last epoch
@@ -578,18 +587,18 @@ def main():
             print(f'[DKL][{ep}/{args.epochs_fusion}] loss={loss_avg:.4f} acc={acc_avg:.2f}% val={val_acc*100:.2f}% | PGD-40: clean={clean_acc*100:.2f}% robust={robust_acc*100:.2f}%')
             if robust_acc > best_robust:
                 best_robust = robust_acc
-                torch.save(fusion.state_dict(), os.path.join(model_dir, 'fusion-best.pt'))
+                torch.save(raw_model.state_dict(), os.path.join(model_dir, 'fusion-best.pt'))
                 print(f'[DKL][{ep}] New best PGD-40={robust_acc*100:.2f}%, saved fusion-best.pt')
         else:
             print(f'[DKL][{ep}/{args.epochs_fusion}] loss={loss_avg:.4f} acc={acc_avg:.2f}% val={val_acc*100:.2f}%')
 
         if ema is not None:
-            ema.restore(fusion)
+            ema.restore(raw_model)
         fusion.train()
 
         # Save last checkpoint (for resume)
         ckpt = {
-            'model_state_dict': fusion.state_dict(),
+            'model_state_dict': raw_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'ema_shadow': ema.shadow if ema is not None else {},
@@ -600,10 +609,10 @@ def main():
 
     # Save final model with EMA weights
     if ema is not None:
-        ema.apply_to(fusion)
-    torch.save(fusion.state_dict(), os.path.join(model_dir, 'fusion-last.pt'))
+        ema.apply_to(raw_model)
+    torch.save(raw_model.state_dict(), os.path.join(model_dir, 'fusion-last.pt'))
     if ema is not None:
-        ema.restore(fusion)
+        ema.restore(raw_model)
 
 
 if __name__ == '__main__':

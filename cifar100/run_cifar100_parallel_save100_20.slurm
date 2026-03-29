@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=parallel_cifar100_s6
-#SBATCH --partition=DGXH200
+#SBATCH --partition=DGXA100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
+#SBATCH --gres=gpu:3
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=192G
 #SBATCH --time=72:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
