@@ -1,115 +1,116 @@
-# News
-* Our new paper ["Generative Distribution Distillation"]() achieves new state-of-the-art on **supervised and unsupervised knowledge distillation**. [Code](https://github.com/jiequancui/Generative-Distribution-Distillation) is released.
+# Parallel Fusion Adversarial Training with DKL Loss
 
-# Generalized Kullback-Leibler (DKL) Divergence Loss
-This repository contains the implementation code for our **NeurIPS 2024** paper **Decoupled Kullback-Leibler (DKL) Divergence Loss**, [arXiv](https://arxiv.org/pdf/2305.13948) and our arXiv paper **Generalized Kullback-Leibler Divergence Loss**, [arXiv]().
+Improving adversarial robustness through **parallel sub-network fusion** on top of the [Decoupled Kullback-Leibler (DKL) Divergence Loss](https://arxiv.org/pdf/2305.13948) (NeurIPS 2024).
 
-## Overview
-In this paper, we delve deeper into the Kullback–Leibler (KL) Divergence loss and mathematically prove that it is equivalent to the Decoupled Kullback-Leibler (DKL) Divergence loss that consists of 1) a weighted Mean Square Error ($\mathbf{w}$MSE) loss and 2) a Cross-Entropy loss incorporating soft labels. 
-Thanks to the decoupled structure of DKL loss, we have identified two areas for improvement.
-Firstly, we address the limitation of KL loss in scenarios like knowledge distillation by breaking its asymmetric optimization property along with a smoother weight function. This modification effectively alleviates convergence challenges in optimization, particularly for classes with high predicted scores in soft labels.
-Secondly, we introduce class-wise global information into KL/DKL to reduce bias arising from individual samples.
-With these two enhancements, we derive the Generalized Kullback–Leibler (GKL) Divergence loss and evaluate its effectiveness by conducting experiments on CIFAR-10/100, ImageNet, and vision-language datasets, focusing on adversarial training, and knowledge distillation tasks. Specifically, we achieve new state-of-the-art adversarial robustness on the public leaderboard --- **RobustBench** and competitive knowledge distillation performance across CIFAR/ImageNet models and CLIP models, demonstrating the substantial practical merits. 
+## Motivation
 
-![image](https://github.com/jiequancui/DKL/blob/main/DKLv2/figures/gkl.PNG)
+Standard adversarial training (e.g., TRADES, DKL) relies on a single WideResNet to learn both natural accuracy and adversarial robustness simultaneously. We hypothesize that splitting the representation space across semantically meaningful sub-networks and fusing their embeddings can yield richer, more robust features.
 
-## Environment Settings
-Python==3.8.13      
-Pytorch==1.8.1+cu111    
-Numpy==1.23.1     
-Open-sourced code from [DKD](https://github.com/megvii-research/mdistiller) is used for fair comparions.
+**Key Insight:** By grouping CIFAR classes into semantically coherent meta-groups (based on coarse superclass hierarchy) and training dedicated sub-networks per group, each sub-network specializes on a subset of visual concepts. The fused embedding captures complementary information that a single network cannot, improving both clean accuracy and adversarial robustness.
 
+## Method
 
-## Knowledge Distillation
+1. **Stage 1 (Sub-network Pre-training):** Train separate WideResNet sub-networks on semantically grouped class subsets using cross-entropy loss.
+2. **Stage 2 (Fusion + Adversarial Training):** Concatenate sub-network embeddings, add a linear fusion head for full classification, and fine-tune end-to-end with DKL adversarial training (+ AWP, progressive epsilon warmup, EMA).
 
-Please refer to [KD-dkl](https://github.com/jiequancui/DKL/tree/main/DKLv2/KD-dkl) for training and evaluation.
+Architecture: `WRN sub-networks -> Embedding Concatenation -> FC -> 10/100 classes`
 
+## Results
 
-## Imbalanced Knowledge Distillation
+### CIFAR-10 (epsilon = 8/255)
 
-Please refer to [Imbalanced-KD-dkl](https://github.com/jiequancui/DKL/tree/main/DKLv2/Imbalanced_KD-dkl) for training and evaluation.
+| Model | Architecture | Clean Acc | AutoAttack |
+|-------|-------------|-----------|------------|
+| DKL baseline | WRN-34-10 | 84.30 | 56.35 |
+| **Ours** | **WRN-34-10 x 2 + FC** | **86.58** | **57.15** |
 
+> Clean **+2.28**, AutoAttack **+0.80** (evaluated at epoch 180)
 
-## Adversarial Robustness
-**By 2023/05/20**, with GKL loss, we achieve new state-of-the-art adversarial robustness under settings that **with/without augmentation strategies** on [auto-attack](https://robustbench.github.io/).
+### CIFAR-100 (epsilon = 8/255)
 
-Please refer to [Adv-training-dkl](https://github.com/jiequancui/DKL/tree/main/DKLv2/Adv-training-dkl) for training and evaluation.
+| Model | Architecture | Clean Acc | AutoAttack |
+|-------|-------------|-----------|------------|
+| DKL baseline | WRN-34-10 | 65.18 | 31.22 |
+| **Ours** | **WRN-34-10 x 4 + FC** | **69.36** | **32.54** |
 
+> Clean **+4.18**, AutoAttack **+1.32** (evaluated at epoch 200)
 
+## Project Structure
 
-
-
-# Decoupled Kullback-Leibler (DKL) Divergence Loss
-This repository contains the implementation code for our **NeurIPS 2024** paper **Decoupled Kullback-Leibler (DKL) Divergence Loss**, [arXiv](https://arxiv.org/pdf/2305.13948) and our arXiv paper **Generalized Kullback-Leibler Divergence Loss**, [arXiv]().
-
-## Overview
-In this paper, we delve deeper into the Kullback–Leibler (KL) Divergence loss and mathematically prove that it is equivalent to the Decoupled Kullback-Leibler (DKL) Divergence loss that consists of 1) a weighted Mean Square Error ($\mathbf{w}$MSE) loss and 2) a Cross-Entropy loss incorporating soft labels. 
-Thanks to the decomposed formulation of DKL loss, we have identified two areas for improvement. 
-Firstly, we address the limitation of KL/DKL in scenarios like knowledge distillation by breaking its asymmetric optimization property. This modification ensures that the $\mathbf{w}$MSE component is always effective during training, providing extra constructive cues. Secondly, we introduce class-wise global information into KL/DKL to mitigate bias from individual samples. With these two enhancements, we derive the Improved Kullback–Leibler (IKL) Divergence loss and evaluate its effectiveness by conducting experiments on CIFAR-10/100 and ImageNet datasets, focusing on adversarial training and knowledge distillation tasks. The proposed approach achieves new state-of-the-art adversarial robustness on the public leaderboard --- **RobustBench** and competitive performance on knowledge distillation, demonstrating the substantial practical merits.
-
-![image](https://github.com/jiequancui/DKL/blob/main/DKLv1/figures/dkl.PNG)
-
-
-
-## Knowledge Distillation
-
-Please refer to [KD-dkl](https://github.com/jiequancui/DKL/tree/main/DKLv1/KD-dkl) for training and evaluation.
-
-
-## Imbalanced Knowledge Distillation
-
-Please refer to [Imbalanced-KD-dkl](https://github.com/jiequancui/DKL/tree/main/DKLv1/Imbalanced_KD-dkl) for training and evaluation.
-
-
-## Adversarial Robustness
-**By 2023/05/20**, with IKL loss, we achieve new state-of-the-art adversarial robustness under settings that **with/without augmentation strategies** on [auto-attack](https://robustbench.github.io/).
-
-Please refer to [Adv-training-dkl](https://github.com/jiequancui/DKL/tree/main/DKLv1/Adv-training-dkl) for training and evaluation.
-
-## Semi-supervised Learning
-
-Please refer to [Semi-Supervised-Learning-dkl](https://github.com/jiequancui/DKL/tree/main/DKLv1/Semi-supervised-learning-dkl) for training and evaluation.
-
-
-# Contact
-If you have any questions, feel free to contact us through email (jiequancui@gmail.com) or Github issues. Enjoy!
-
-# BibTex
-If you find this code or idea useful, please consider citing our related work:
 ```
+cifar10/
+  model/          # Fusion architectures (parallel, gated, soft-routing)
+  train/          # Training scripts for 4 fusion methods
+  eval/           # AutoAttack evaluation
+cifar100/
+  model/          # Parallel fusion WRN for 100 classes
+  train/          # Parallel fusion training
+  eval/           # AutoAttack evaluation
+DKLv1/
+  Adv-training-dkl/   # DKL baseline reproduction
+```
+
+### CIFAR-10: Four Fusion Methods
+
+| Method | Description |
+|--------|-------------|
+| **Parallel** | Two WRN sub-networks, embedding concatenation + FC |
+| **Gated** | Learned sigmoid gating weights for fusion |
+| **Soft Routing** | Asymmetric weighting based on unknown score |
+| **Confidence Routing** | Simplified routing based on prediction confidence |
+
+### CIFAR-100: Parallel Fusion
+
+Four meta-groups by coarse superclass (textured organic / smooth organic / rigid man-made / large structures), each with a dedicated WRN-34-10 sub-network, fused via embedding concatenation + FC.
+
+## Training
+
+```bash
+# CIFAR-10 Parallel Fusion
+cd DKL
+PYTHONPATH=.:DKLv1/Adv-training-dkl python cifar10/train/parallel.py \
+  --epochs-sub 100 --epochs-fusion 200 \
+  --epsilon 0.031372549 --alpha 4.0 --beta 20.0 --T 4.0 \
+  --train_budget high --sub-depth 34 --sub-widen 10 \
+  --awp-gamma 0.005 --awp-warmup 10
+
+# CIFAR-100 Parallel Fusion
+PYTHONPATH=.:DKLv1/Adv-training-dkl python cifar100/train/parallel.py \
+  --epochs-sub 100 --epochs-fusion 200 \
+  --epsilon 0.031372549 --alpha 4.0 --beta 20.0 --T 4.0 \
+  --train_budget high --sub-depth 34 --sub-widen 10 \
+  --awp-gamma 0.005 --awp-warmup 10
+```
+
+## Evaluation
+
+```bash
+# AutoAttack (CIFAR-10)
+PYTHONPATH=.:DKLv1/Adv-training-dkl python cifar10/eval/parallel.py \
+  --model-path <checkpoint>
+
+# AutoAttack (CIFAR-100)
+PYTHONPATH=.:DKLv1/Adv-training-dkl python cifar100/eval/parallel.py \
+  --model-path <checkpoint>
+```
+
+## DKL Baseline Reproduction
+
+Based on the [DKL](https://github.com/jiequancui/DKL) codebase (NeurIPS 2024). See `DKLv1/Adv-training-dkl/` for standalone baseline training scripts.
+
+```bash
+cd DKLv1/Adv-training-dkl
+python train_dkl_cifar10.py --arch WideResNet34_10 --train_budget high \
+  --epsilon 8 --alpha 4.0 --beta 20.0 --T 4.0 --lr 0.2 --epochs 200
+```
+
+## Citation
+
+```bibtex
 @article{cui2023decoupled,
   title={Decoupled Kullback-Leibler Divergence Loss},
   author={Cui, Jiequan and Tian, Zhuotao and Zhong, Zhisheng and Qi, Xiaojuan and Yu, Bei and Zhang, Hanwang},
   journal={arXiv preprint arXiv:2305.13948},
   year={2023}
 }
-
-@inproceedings{cui2021learnable,
-  title={Learnable boundary guided adversarial training},
-  author={Cui, Jiequan and Liu, Shu and Wang, Liwei and Jia, Jiaya},
-  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
-  pages={15721--15730},
-  year={2021}
-}
-
-@ARTICLE{10130611,
-  author={Cui, Jiequan and Zhong, Zhisheng and Tian, Zhuotao and Liu, Shu and Yu, Bei and Jia, Jiaya},
-  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence}, 
-  title={Generalized Parametric Contrastive Learning}, 
-  year={2023},
-  volume={},
-  number={},
-  pages={1-12},
-  doi={10.1109/TPAMI.2023.3278694}}
-
-
-@inproceedings{cui2021parametric,
-  title={Parametric contrastive learning},
-  author={Cui, Jiequan and Zhong, Zhisheng and Liu, Shu and Yu, Bei and Jia, Jiaya},
-  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
-  pages={715--724},
-  year={2021}
-}
-
-
 ```
